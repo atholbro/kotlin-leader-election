@@ -23,6 +23,7 @@ import java.time.ZoneOffset
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.time.Clock
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
@@ -36,6 +37,8 @@ class LeaderElectorTest {
         leaseName: String = "test-lease",
         identity: String,
         api: CoordinationApi = mockApi,
+        leaseDuration: Duration = 1.seconds,
+        renewalDelay: Duration = 250.milliseconds,
         clock: Clock = Clock.System,
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
@@ -44,8 +47,8 @@ class LeaderElectorTest {
         namespace = "ns1",
         identity = identity,
         api = api,
-        leaseDuration = 1.seconds,
-        renewalDelay = 250.milliseconds,
+        leaseDuration = leaseDuration,
+        renewalDelay = renewalDelay,
         clock = clock,
         onFollower = onFollower,
         onLeader = onLeader,
@@ -377,9 +380,8 @@ class LeaderElectorTest {
         fun `leaseDuration is clamped to 1 second`() {
             val channel = Channel<Boolean>()
             val leaseName = "clamped-lease"
-            val elector = LeaderElector(
+            val elector = testElector(
                 leaseName = leaseName,
-                namespace = "ns1",
                 identity = "test-elector-1",
                 api = mockApi,
                 leaseDuration = 100.milliseconds,
