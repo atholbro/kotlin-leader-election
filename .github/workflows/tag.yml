@@ -1,0 +1,26 @@
+name: Bump version
+on:
+  push:
+    branches:
+      - main
+jobs:
+  tag:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump version and push tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GH_TAG_TOKEN }}
+          default_bump: patch
+          tag_prefix: v
+          custom_release_rules: |
+            "fix:patch:Bug Fixes,patch:patch:Changes,feature:minor:Features,change:minor:Changes,minor:minor:Changes,breaking:major:Breaking Changes,major:major:Major Changes"
+      - name: Create a GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
