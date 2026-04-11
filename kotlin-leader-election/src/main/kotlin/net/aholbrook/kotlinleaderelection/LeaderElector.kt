@@ -27,7 +27,9 @@ import kotlin.time.toJavaInstant
 private val logger = KotlinLogging.logger {}
 
 private enum class Role {
-    LEADER, FOLLOWER, STOPPED
+    LEADER,
+    FOLLOWER,
+    STOPPED,
 }
 
 class LeaderElector internal constructor(
@@ -85,7 +87,7 @@ class LeaderElector internal constructor(
         renewalDelay = renewalDelay,
         clock = Clock.System,
         onFollower = onFollower,
-        onLeader = onLeader
+        onLeader = onLeader,
     )
 
     suspend fun start(dispatcher: CoroutineDispatcher = Dispatchers.Default) {
@@ -120,7 +122,7 @@ class LeaderElector internal constructor(
                 if (role != oldRole) {
                     roleJob.cancelAndJoin()
 
-                    roleJob = when(role) {
+                    roleJob = when (role) {
                         Role.LEADER -> startLeader(dispatcher)
                         else -> startFollower(dispatcher)
                     }

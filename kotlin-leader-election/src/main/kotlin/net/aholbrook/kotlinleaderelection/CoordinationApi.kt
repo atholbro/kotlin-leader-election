@@ -18,5 +18,4 @@ internal class DelegatingCoordinationApi(private val api: CoordinationV1Api) : C
 
     override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease =
         api.replaceNamespacedLease(leaseName, namespace, lease).execute()
-
 }
