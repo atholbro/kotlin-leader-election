@@ -27,18 +27,20 @@ import kotlin.time.toJavaInstant
 private val logger = KotlinLogging.logger {}
 
 private enum class Role {
-    LEADER, FOLLOWER, STOPPED
+    LEADER,
+    FOLLOWER,
+    STOPPED,
 }
 
 class LeaderElector internal constructor(
     private val leaseName: String,
-    private val namespace: String = getNamespace(),
-    private val identity: String = getHostname(),
-    private val api: CoordinationApi = DelegatingCoordinationApi(CoordinationV1Api()),
-    private val leaseDuration: Duration = 30.seconds,
-    private val renewalDelay: Duration = 5.seconds,
-    private val clock: Clock = Clock.System,
-    private val onFollower: (suspend () -> Unit) = { },
+    private val namespace: String,
+    private val identity: String,
+    private val api: CoordinationApi,
+    private val leaseDuration: Duration,
+    private val renewalDelay: Duration,
+    private val clock: Clock,
+    private val onFollower: (suspend () -> Unit),
     private val onLeader: suspend () -> Unit,
 ) {
     private val lifecycleMutex = Mutex()
@@ -50,14 +52,43 @@ class LeaderElector internal constructor(
 
     constructor(
         leaseName: String,
-        namespace: String = getNamespace(),
-        identity: String = getHostname(),
-        api: CoordinationApi = DelegatingCoordinationApi(CoordinationV1Api()),
+        api: CoordinationV1Api = CoordinationV1Api(),
         leaseDuration: Duration = 30.seconds,
         renewalDelay: Duration = 5.seconds,
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
-    ) : this(leaseName, namespace, identity, api, leaseDuration, renewalDelay, Clock.System, onFollower, onLeader)
+    ) : this(
+        leaseName = leaseName,
+        namespace = getNamespace(),
+        identity = getHostname(),
+        api = DelegatingCoordinationApi(api),
+        leaseDuration = leaseDuration,
+        renewalDelay = renewalDelay,
+        clock = Clock.System,
+        onFollower = onFollower,
+        onLeader = onLeader,
+    )
+
+    constructor(
+        leaseName: String,
+        namespace: String = getNamespace(),
+        identity: String = getHostname(),
+        api: CoordinationV1Api = CoordinationV1Api(),
+        leaseDuration: Duration = 30.seconds,
+        renewalDelay: Duration = 5.seconds,
+        onFollower: (suspend () -> Unit) = { },
+        onLeader: suspend () -> Unit,
+    ) : this(
+        leaseName = leaseName,
+        namespace = namespace,
+        identity = identity,
+        api = DelegatingCoordinationApi(api),
+        leaseDuration = leaseDuration,
+        renewalDelay = renewalDelay,
+        clock = Clock.System,
+        onFollower = onFollower,
+        onLeader = onLeader,
+    )
 
     suspend fun start(dispatcher: CoroutineDispatcher = Dispatchers.Default) {
         lifecycleMutex.withLock {
@@ -91,7 +122,7 @@ class LeaderElector internal constructor(
                 if (role != oldRole) {
                     roleJob.cancelAndJoin()
 
-                    roleJob = when(role) {
+                    roleJob = when (role) {
                         Role.LEADER -> startLeader(dispatcher)
                         else -> startFollower(dispatcher)
                     }

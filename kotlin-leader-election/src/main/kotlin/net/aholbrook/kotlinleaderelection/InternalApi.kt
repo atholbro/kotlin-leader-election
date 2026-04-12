@@ -1,7 +1,7 @@
 package net.aholbrook.kotlinleaderelection
 
 @RequiresOptIn(
-    message = "This is an internal Paseto API and subject to change without notice.",
+    message = "This is an internal kotlin-leader-election API and subject to change without notice.",
     level = RequiresOptIn.Level.ERROR,
 )
 @Retention(AnnotationRetention.BINARY)
@@ -13,4 +13,4 @@ package net.aholbrook.kotlinleaderelection
     AnnotationTarget.TYPEALIAS,
     AnnotationTarget.CONSTRUCTOR,
 )
-annotation class InternalApi
+internal annotation class InternalApi

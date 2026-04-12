@@ -23,6 +23,7 @@ import java.time.ZoneOffset
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.time.Clock
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.Instant
@@ -36,6 +37,8 @@ class LeaderElectorTest {
         leaseName: String = "test-lease",
         identity: String,
         api: CoordinationApi = mockApi,
+        leaseDuration: Duration = 1.seconds,
+        renewalDelay: Duration = 250.milliseconds,
         clock: Clock = Clock.System,
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
@@ -44,8 +47,8 @@ class LeaderElectorTest {
         namespace = "ns1",
         identity = identity,
         api = api,
-        leaseDuration = 1.seconds,
-        renewalDelay = 250.milliseconds,
+        leaseDuration = leaseDuration,
+        renewalDelay = renewalDelay,
         clock = clock,
         onFollower = onFollower,
         onLeader = onLeader,
@@ -68,13 +71,17 @@ class LeaderElectorTest {
     @Test
     fun `given many electors, only one becomes leader`() {
         val channel = Channel<Boolean>()
-        suspend fun onFollower() { channel.send(false) }
-        suspend fun onLeader() { channel.send(true) }
+        suspend fun onFollower() {
+            channel.send(false)
+        }
+        suspend fun onLeader() {
+            channel.send(true)
+        }
 
         val electors = listOf(
             testElector(identity = "test-elector-1", onFollower = ::onFollower, onLeader = ::onLeader),
             testElector(identity = "test-elector-2", onFollower = ::onFollower, onLeader = ::onLeader),
-            testElector(identity = "test-elector-3", onFollower = ::onFollower, onLeader = ::onLeader)
+            testElector(identity = "test-elector-3", onFollower = ::onFollower, onLeader = ::onLeader),
         ).shuffled()
 
         runBlocking {
@@ -98,9 +105,9 @@ class LeaderElectorTest {
             testElector(identity = "test-elector-2", onFollower = { channel.send("follower-2") }) {
                 channel.send("leader-2")
             },
-            testElector(identity = "test-elector-3", onFollower = { channel.send("follower-3")}) {
+            testElector(identity = "test-elector-3", onFollower = { channel.send("follower-3") }) {
                 channel.send("leader-3")
-            }
+            },
         )
 
         runBlocking {
@@ -202,7 +209,7 @@ class LeaderElectorTest {
 
         mockApi.callLog
             .filterIsInstance<ReplaceNamespacedLease>()
-            .filter { it.response.spec?.holderIdentity==null }
+            .filter { it.response.spec?.holderIdentity == null }
             .size shouldBe 1
     }
 
@@ -299,7 +306,6 @@ class LeaderElectorTest {
                 elector.start()
                 withTimeout(5.seconds) { channel.receive() } shouldBe true
 
-
                 // wait for the replace call to occur
                 shouldNotThrow<TimeoutCancellationException> {
                     withTimeout(5.seconds) {
@@ -377,9 +383,8 @@ class LeaderElectorTest {
         fun `leaseDuration is clamped to 1 second`() {
             val channel = Channel<Boolean>()
             val leaseName = "clamped-lease"
-            val elector = LeaderElector(
+            val elector = testElector(
                 leaseName = leaseName,
-                namespace = "ns1",
                 identity = "test-elector-1",
                 api = mockApi,
                 leaseDuration = 100.milliseconds,
@@ -582,14 +587,11 @@ class LeaderElectorTest {
         @Test
         fun `when create conflicts elector does not become leader`() {
             val api = object : CoordinationApi {
-                override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease =
-                    throw ApiException(404, "not found")
+                override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease = throw ApiException(404, "not found")
 
-                override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease =
-                    throw ApiException(409, "already exists")
+                override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease = throw ApiException(409, "already exists")
 
-                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease =
-                    throw ApiException(500, "should not be called")
+                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease = throw ApiException(500, "should not be called")
             }
 
             val channel = Channel<Boolean>()
@@ -657,11 +659,9 @@ class LeaderElectorTest {
                     throw ApiException(401, "unauthorized")
                 }
 
-                override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease =
-                    throw ApiException(500, "should not be called")
+                override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease = throw ApiException(500, "should not be called")
 
-                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease =
-                    throw ApiException(500, "should not be called")
+                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease = throw ApiException(500, "should not be called")
             }
 
             val elector = testElector(
@@ -687,11 +687,9 @@ class LeaderElectorTest {
                     throw IllegalStateException("boom")
                 }
 
-                override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease =
-                    throw ApiException(500, "should not be called")
+                override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease = throw ApiException(500, "should not be called")
 
-                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease =
-                    throw ApiException(500, "should not be called")
+                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease = throw ApiException(500, "should not be called")
             }
 
             val elector = testElector(
@@ -781,39 +779,35 @@ class MockCoordinationApi : CoordinationApi {
     private var version: Int = 0
 
     private val backingCallLog = mutableListOf<CoordinationApiCall>()
-    val callLog: List<CoordinationApiCall> get() { return backingCallLog.toList() }
+    val callLog: List<CoordinationApiCall> get() {
+        return backingCallLog.toList()
+    }
 
-    override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease {
-        return lock.withLock {
-            (leases["$namespace/$leaseName"] ?: throw ApiException(404, "not found"))
-                .also { backingCallLog.add(ReadNamespacedLease(leaseName, namespace, it)) }
+    override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease = lock.withLock {
+        (leases["$namespace/$leaseName"] ?: throw ApiException(404, "not found"))
+            .also { backingCallLog.add(ReadNamespacedLease(leaseName, namespace, it)) }
+    }
+
+    override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease = lock.withLock {
+        lease.metadata!!.resourceVersion = (++version).toString()
+
+        if (leases.containsKey("$namespace/${lease.metadata!!.name}")) {
+            throw ApiException(409, "already exists")
+        } else {
+            leases["$namespace/${lease.metadata!!.name}"] = lease
+            lease.also { backingCallLog.add(CreateNamespacedLease(namespace, lease, it)) }
         }
     }
 
-    override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease {
-        return lock.withLock {
+    override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease = lock.withLock {
+        val existingLease = leases["$namespace/$leaseName"] ?: throw ApiException(404, "not found")
+
+        if (existingLease.metadata!!.resourceVersion != lease.metadata!!.resourceVersion) {
+            throw ApiException(409, "already modified")
+        } else {
             lease.metadata!!.resourceVersion = (++version).toString()
-
-            if (leases.containsKey("$namespace/${lease.metadata!!.name}")) {
-                throw ApiException(409, "already exists")
-            } else {
-                leases["$namespace/${lease.metadata!!.name}"] = lease
-                lease.also { backingCallLog.add(CreateNamespacedLease(namespace, lease, it)) }
-            }
-        }
-    }
-
-    override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease {
-        return lock.withLock {
-            val existingLease = leases["$namespace/$leaseName"] ?: throw ApiException(404, "not found")
-
-            if (existingLease.metadata!!.resourceVersion != lease.metadata!!.resourceVersion) {
-                throw ApiException(409, "already modified")
-            } else {
-                lease.metadata!!.resourceVersion = (++version).toString()
-                leases["$namespace/$leaseName"] = lease
-                lease.also { backingCallLog.add(ReplaceNamespacedLease(leaseName, namespace, lease, it)) }
-            }
+            leases["$namespace/$leaseName"] = lease
+            lease.also { backingCallLog.add(ReplaceNamespacedLease(leaseName, namespace, lease, it)) }
         }
     }
 }
@@ -825,18 +819,18 @@ sealed interface CoordinationApiCall {
 data class ReadNamespacedLease(
     val leaseName: String,
     val namespace: String,
-    override val response: V1Lease
+    override val response: V1Lease,
 ) : CoordinationApiCall
 
 data class CreateNamespacedLease(
     val namespace: String,
     val lease: V1Lease,
-    override val response: V1Lease
+    override val response: V1Lease,
 ) : CoordinationApiCall
 
 data class ReplaceNamespacedLease(
     val leaseName: String,
     val namespace: String,
     val lease: V1Lease,
-    override val response: V1Lease
+    override val response: V1Lease,
 ) : CoordinationApiCall
