@@ -30,6 +30,14 @@ private enum class Role {
     STOPPED,
 }
 
+/**
+ * Coordinates Kubernetes lease-based leader election.
+ *
+ * The elector runs a background coroutine that periodically reads or updates the target Lease.
+ * Role changes trigger [onLeader] and [onFollower]. Errors are reported through [onError].
+ *
+ * Call [start] to begin participating in election and [stop] to stop participating.
+ */
 class LeaderElector internal constructor(
     private val leaseName: String,
     private val namespace: String,
@@ -49,6 +57,17 @@ class LeaderElector internal constructor(
     private var role: Role = Role.STOPPED
     private var electorJob: Job = Job().apply { complete() }
 
+    /**
+     * Creates an elector using namespace and identity discovered from the runtime environment.
+     *
+     * @param leaseName lease name used for election coordination
+     * @param api Kubernetes Coordination API client
+     * @param leaseDuration desired lease duration used when creating or acquiring the lease
+     * @param renewalDelay delay between election loop iterations
+     * @param onError callback for elector loop errors, with `isFatal=true` when the loop exits
+     * @param onFollower callback invoked when this elector transitions to follower
+     * @param onLeader callback invoked when this elector transitions to leader
+     */
     constructor(
         leaseName: String,
         api: CoordinationV1Api = CoordinationV1Api(),
@@ -70,6 +89,19 @@ class LeaderElector internal constructor(
         onLeader = onLeader,
     )
 
+    /**
+     * Creates an elector with explicit namespace and identity values.
+     *
+     * @param leaseName lease name used for election coordination
+     * @param namespace Kubernetes namespace where the Lease exists
+     * @param identity leaseholder identity written to the Lease when leader
+     * @param api Kubernetes Coordination API client
+     * @param leaseDuration desired lease duration used when creating or acquiring the lease
+     * @param renewalDelay delay between election loop iterations
+     * @param onError callback for elector loop errors, with `isFatal=true` when the loop exits
+     * @param onFollower callback invoked when this elector transitions to follower
+     * @param onLeader callback invoked when this elector transitions to leader
+     */
     constructor(
         leaseName: String,
         namespace: String = getNamespace(),
@@ -93,6 +125,14 @@ class LeaderElector internal constructor(
         onLeader = onLeader,
     )
 
+    /**
+     * Starts participating in leader election.
+     *
+     * This function returns after launching the elector loop. It is safe to call multiple times;
+     * subsequent calls while already running are no-ops.
+     *
+     * @param dispatcher dispatcher used to execute [onLeader] and [onFollower]
+     */
     suspend fun start(dispatcher: CoroutineDispatcher = Dispatchers.Default) {
         lifecycleMutex.withLock {
             if (electorJob.isActive) return@withLock
@@ -103,6 +143,11 @@ class LeaderElector internal constructor(
         }
     }
 
+    /**
+     * Stops participating in leader election and waits for background work to finish.
+     *
+     * If this elector is currently leader, it attempts to release the lease before stopping.
+     */
     suspend fun stop() {
         lifecycleMutex.withLock {
             electorJob.cancelAndJoin()
