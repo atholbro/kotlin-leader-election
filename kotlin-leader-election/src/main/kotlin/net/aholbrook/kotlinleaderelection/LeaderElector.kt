@@ -3,8 +3,6 @@ package net.aholbrook.kotlinleaderelection
 import io.kubernetes.client.openapi.ApiException
 import io.kubernetes.client.openapi.apis.CoordinationV1Api
 import io.kubernetes.client.openapi.models.V1Lease
-import io.kubernetes.client.openapi.models.V1LeaseSpec
-import io.kubernetes.client.openapi.models.V1ObjectMeta
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
@@ -175,7 +173,7 @@ class LeaderElector internal constructor(
             }
         }
 
-        val spec = lease.spec ?: return
+        val spec = lease.spec ?: error("Invalid lease, missing spec")
         val leader = spec.holderIdentity
         val renewTime = spec.renewTime
         val leaseDurationSeconds = (spec.leaseDurationSeconds?.toLong() ?: leaseDuration.inWholeSeconds)
@@ -213,7 +211,7 @@ class LeaderElector internal constructor(
             }
         }
 
-        val spec = lease.spec ?: return
+        val spec = lease.spec ?: error("Invalid lease, missing spec")
         val leader = spec.holderIdentity
 
         if (leader == identity) {
@@ -254,50 +252,4 @@ class LeaderElector internal constructor(
             }
         }
     }
-}
-
-private fun buildLeaseResource(
-    leaseName: String,
-    namespace: String,
-    identity: String?,
-    leaseDurationSeconds: Int,
-    resourceVersion: String?,
-    clock: Clock,
-): V1Lease = V1Lease()
-    .metadata(
-        V1ObjectMeta()
-            .name(leaseName)
-            .namespace(namespace)
-            .resourceVersion(resourceVersion),
-    ).spec(
-        V1LeaseSpec()
-            .holderIdentity(identity)
-            .leaseDurationSeconds(leaseDurationSeconds.coerceAtLeast(1))
-            .renewTime(clock.now().toJavaInstant().atOffset(ZoneOffset.UTC)),
-    )
-
-private fun V1Lease.buildAcquire(identity: String, leaseDurationSeconds: Int, clock: Clock): V1Lease {
-    val metadata = requireNotNull(metadata)
-
-    return buildLeaseResource(
-        leaseName = requireNotNull(metadata.name),
-        namespace = requireNotNull(metadata.namespace),
-        identity = identity,
-        leaseDurationSeconds = leaseDurationSeconds,
-        resourceVersion = requireNotNull(metadata.resourceVersion),
-        clock = clock,
-    )
-}
-
-private fun V1Lease.buildRelease(clock: Clock): V1Lease {
-    val metadata = requireNotNull(metadata)
-
-    return buildLeaseResource(
-        leaseName = requireNotNull(metadata.name),
-        namespace = requireNotNull(metadata.namespace),
-        identity = null,
-        leaseDurationSeconds = 1,
-        resourceVersion = requireNotNull(metadata.resourceVersion),
-        clock = clock,
-    )
 }
