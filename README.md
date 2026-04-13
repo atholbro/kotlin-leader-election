@@ -1,7 +1,7 @@
 # Kotlin Leader Election (via Kubernetes Leases)
 [![Build](https://github.com/atholbro/kotlin-leader-election/actions/workflows/build.yml/badge.svg)](https://github.com/atholbro/kotlin-leader-election/actions/workflows/build.yml)
 [![Maven Central Version](https://img.shields.io/maven-central/v/net.aholbrook.kotlin-leader-election/kotlin-leader-election)](https://central.sonatype.com/artifact/net.aholbrook.kotlin-leader-election/kotlin-leader-election)
-[![codecov](https://codecov.io/gh/atholbro/kotlin-leader-election/branch/master/graph/badge.svg)](https://codecov.io/gh/atholbro/kotlin-leader-election)
+[![codecov](https://codecov.io/gh/atholbro/kotlin-leader-election/graph/badge.svg?token=LCJIWJH2EG)](https://codecov.io/gh/atholbro/kotlin-leader-election)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 `kotlin-leader-election` is a small Kotlin library that coordinates leadership across replicas using
