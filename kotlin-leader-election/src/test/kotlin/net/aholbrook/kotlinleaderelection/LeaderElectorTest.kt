@@ -25,6 +25,8 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.time.ZoneOffset
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -46,6 +48,7 @@ class LeaderElectorTest {
         leaseDuration: Duration = 1.seconds,
         renewalDelay: Duration = 250.milliseconds,
         clock: Clock = Clock.System,
+        onError: (cause: Throwable, isFatal: Boolean) -> Unit = { _, _ -> },
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
     ) = LeaderElector(
@@ -56,6 +59,7 @@ class LeaderElectorTest {
         leaseDuration = leaseDuration,
         renewalDelay = renewalDelay,
         clock = clock,
+        onError = onError,
         onFollower = onFollower,
         onLeader = onLeader,
     )
@@ -536,6 +540,7 @@ class LeaderElectorTest {
     inner class ErrorHandlingTests {
         @Test
         fun `when read gets unknown api error elector retries and eventually becomes leader`() {
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi by mockApi {
                 private var readCount = 0
 
@@ -552,12 +557,16 @@ class LeaderElectorTest {
                 leaseName = "unknown-read-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) {
                 channel.send(true)
             }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe false
+                (cause is ApiException) shouldBe true
                 withTimeout(5.seconds) { channel.receive() } shouldBe true
                 elector.stop()
             }
@@ -631,6 +640,7 @@ class LeaderElectorTest {
 
         @Test
         fun `when read gets transient error elector retries and eventually becomes leader`() {
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi by mockApi {
                 private var readCount = 0
 
@@ -647,12 +657,16 @@ class LeaderElectorTest {
                 leaseName = "transient-read-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) {
                 channel.send(true)
             }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe false
+                (cause as ApiException).code shouldBe 500
                 withTimeout(5.seconds) { channel.receive() } shouldBe true
                 elector.stop()
             }
@@ -726,6 +740,7 @@ class LeaderElectorTest {
 
         @Test
         fun `when read gets auth error elector loop exits`() {
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi {
                 override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease = throw ApiException(401, "unauthorized")
 
@@ -738,10 +753,14 @@ class LeaderElectorTest {
                 leaseName = "auth-error-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) { }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                (cause as ApiException).code shouldBe 401
                 delay(500.milliseconds)
                 elector.stop()
             }
@@ -749,6 +768,7 @@ class LeaderElectorTest {
 
         @Test
         fun `when read throws unexpected exception elector loop exits`() {
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi {
                 override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease {
                     error("boom")
@@ -763,10 +783,14 @@ class LeaderElectorTest {
                 leaseName = "throwable-error-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) { }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                cause.message shouldBe "boom"
                 delay(500.milliseconds)
                 elector.stop()
             }
@@ -774,6 +798,7 @@ class LeaderElectorTest {
 
         @Test
         fun `when lease spec is missing during acquire elector loop exits`() {
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             mockApi.createNamespacedLease(
                 namespace = "ns1",
                 lease = V1Lease().metadata(V1ObjectMeta().name("test").namespace("ns1")),
@@ -783,15 +808,69 @@ class LeaderElectorTest {
             val elector = testElector(
                 leaseName = "test",
                 identity = "test-elector-1",
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
                 onFollower = { channel.send(false) },
             ) { channel.send(true) }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                cause.message shouldBe "Invalid lease, missing spec"
 
                 shouldThrow<TimeoutCancellationException> {
                     withTimeout(1.seconds) { channel.receive() }
                 }
+            }
+        }
+
+        @Test
+        fun `when fatal error happens as leader the lease is released and elector can restart`() {
+            val api = object : CoordinationApi by mockApi {
+                private var replaceCount = 0
+                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease {
+                    if (++replaceCount == 1) {
+                        error("boom")
+                    }
+
+                    return mockApi.replaceNamespacedLease(leaseName, namespace, lease)
+                }
+            }
+
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
+            val channel = Channel<Boolean>()
+            val elector = testElector(
+                identity = "test-elector-1",
+                api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
+            ) {
+                channel.send(true)
+            }
+
+            runBlocking {
+                elector.start()
+                withTimeout(5.seconds) { channel.receive() } shouldBe true
+
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                cause.message shouldBe "boom"
+
+                // wait for clean up call
+                shouldNotThrow<TimeoutCancellationException> {
+                    withTimeout(5.seconds) {
+                        while (
+                            mockApi.callLog
+                                .filterIsInstance<ReplaceNamespacedLease>()
+                                .none { it.response.spec?.holderIdentity == null }
+                        ) {
+                            delay(25.milliseconds)
+                        }
+                    }
+                }
+
+                elector.start()
+                withTimeout(5.seconds) { channel.receive() } shouldBe true
+                elector.stop()
             }
         }
 
@@ -891,6 +970,87 @@ class LeaderElectorTest {
                     elector.stop()
                 }
                 exception.code shouldBe 0
+            }
+        }
+
+        @Test
+        fun `errors when lease has null duration`() {
+            val channel = Channel<Boolean>()
+            val elector = testElector(identity = "test-1", onFollower = { channel.send(false) }) {
+                channel.send(true)
+            }
+
+            mockApi.createNamespacedLease(
+                namespace = "ns1",
+                lease = buildLeaseResource(
+                    leaseName = "test-lease",
+                    namespace = "ns1",
+                    identity = "test-1",
+                    leaseDurationSeconds = 1,
+                    resourceVersion = "1.0.0",
+                    clock = Clock.System,
+                ).apply { spec!!.leaseDurationSeconds(null) },
+            )
+
+            runBlocking {
+                shouldThrow<TimeoutCancellationException> {
+                    elector.start()
+                    withTimeout(1.seconds) { channel.receive() }
+                }
+            }
+        }
+
+        @ParameterizedTest
+        @ValueSource(ints = [-1, 0])
+        @DisplayName("errors when lease has {} second duration")
+        fun invalidLeaseDurationTest(value: Int) {
+            val channel = Channel<Boolean>()
+            val elector = testElector(identity = "test-1", onFollower = { channel.send(false) }) {
+                channel.send(true)
+            }
+
+            mockApi.createNamespacedLease(
+                namespace = "ns1",
+                lease = buildLeaseResource(
+                    leaseName = "test-lease",
+                    namespace = "ns1",
+                    identity = "test-1",
+                    leaseDurationSeconds = 1,
+                    resourceVersion = "1.0.0",
+                    clock = Clock.System,
+                ).apply { spec!!.leaseDurationSeconds(value) },
+            )
+
+            runBlocking {
+                shouldThrow<TimeoutCancellationException> {
+                    elector.start()
+                    withTimeout(1.seconds) { channel.receive() }
+                }
+            }
+        }
+
+        @Test
+        fun `assumes lease has expired if renewTime is null`() {
+            val channel = Channel<Boolean>()
+            val elector = testElector(identity = "test-1", onFollower = { channel.send(false) }) {
+                channel.send(true)
+            }
+
+            mockApi.createNamespacedLease(
+                namespace = "ns1",
+                lease = buildLeaseResource(
+                    leaseName = "test-lease",
+                    namespace = "ns1",
+                    identity = "test-1",
+                    leaseDurationSeconds = 1,
+                    resourceVersion = "1.0.0",
+                    clock = Clock.System,
+                ).apply { spec!!.renewTime(null) },
+            )
+
+            runBlocking {
+                elector.start()
+                withTimeout(1.seconds) { channel.receive() } shouldBe true
             }
         }
     }

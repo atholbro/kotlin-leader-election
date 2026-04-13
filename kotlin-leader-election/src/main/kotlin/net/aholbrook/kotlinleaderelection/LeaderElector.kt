@@ -38,6 +38,7 @@ class LeaderElector internal constructor(
     private val leaseDuration: Duration,
     private val renewalDelay: Duration,
     private val clock: Clock,
+    private val onError: (cause: Throwable, isFatal: Boolean) -> Unit,
     private val onFollower: (suspend () -> Unit),
     private val onLeader: suspend () -> Unit,
 ) {
@@ -53,6 +54,7 @@ class LeaderElector internal constructor(
         api: CoordinationV1Api = CoordinationV1Api(),
         leaseDuration: Duration = 30.seconds,
         renewalDelay: Duration = 5.seconds,
+        onError: (cause: Throwable, isFatal: Boolean) -> Unit = { _, _ -> },
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
     ) : this(
@@ -63,6 +65,7 @@ class LeaderElector internal constructor(
         leaseDuration = leaseDuration,
         renewalDelay = renewalDelay,
         clock = Clock.System,
+        onError = onError,
         onFollower = onFollower,
         onLeader = onLeader,
     )
@@ -74,6 +77,7 @@ class LeaderElector internal constructor(
         api: CoordinationV1Api = CoordinationV1Api(),
         leaseDuration: Duration = 30.seconds,
         renewalDelay: Duration = 5.seconds,
+        onError: (cause: Throwable, isFatal: Boolean) -> Unit = { _, _ -> },
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
     ) : this(
@@ -84,6 +88,7 @@ class LeaderElector internal constructor(
         leaseDuration = leaseDuration,
         renewalDelay = renewalDelay,
         clock = Clock.System,
+        onError = onError,
         onFollower = onFollower,
         onLeader = onLeader,
     )
@@ -128,25 +133,36 @@ class LeaderElector internal constructor(
             } catch (e: ApiException) {
                 when (e.code) {
                     401, 403 -> {
+                        onError(e, true)
                         logger.error(e) { "Kubernetes API: auth error" }
                         break
                     }
 
                     500, 502, 503, 504 -> {
+                        onError(e, false)
                         logger.warn(e) { "Transient API error ${e.code}, will retry" }
                     }
 
                     else -> {
+                        onError(e, false)
                         logger.error(e) { "Unexpected Kubernetes API error" }
                     }
                 }
             } catch (e: Throwable) {
+                onError(e, true)
                 logger.error(e) { "Unexpected error" }
                 break
             }
 
             delay(renewalDelay)
         }
+
+        runCatching {
+            if (role == Role.LEADER) {
+                releaseLeaderRole()
+            }
+        }
+        role = Role.STOPPED
     }
 
     private fun CoroutineScope.startLeader(dispatcher: CoroutineDispatcher) =
@@ -176,10 +192,12 @@ class LeaderElector internal constructor(
         val spec = lease.spec ?: error("Invalid lease, missing spec")
         val leader = spec.holderIdentity
         val renewTime = spec.renewTime
-        val leaseDurationSeconds = (spec.leaseDurationSeconds?.toLong() ?: leaseDuration.inWholeSeconds)
-            .coerceAtLeast(1)
+        val leaseDurationSeconds = requireNotNull(spec.leaseDurationSeconds) {
+            "Invalid lease, missing leaseDurationSeconds"
+        }
+        require(leaseDurationSeconds > 0) { "Invalid lease, leaseDurationSeconds must be positive" }
         val now = clock.now().toJavaInstant().atOffset(ZoneOffset.UTC)
-        val expired = renewTime == null || now.isAfter(renewTime.plusSeconds(leaseDurationSeconds))
+        val expired = renewTime == null || now.isAfter(renewTime.plusSeconds(leaseDurationSeconds.toLong()))
 
         when {
             leader == identity -> {
