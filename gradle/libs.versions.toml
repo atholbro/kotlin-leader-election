@@ -15,6 +15,7 @@ kotest = "6.1.11"
 kotlin = "2.3.10"
 kotlinLogging = "3.0.5"
 kotlinter = "5.4.2"
+logbackClassic = "1.5.32"
 mockk = "1.14.9"
 nmcp = "1.4.4"
 
@@ -27,6 +28,7 @@ k8s-client = { module = "io.kubernetes:client-java", version.ref = "k8sClient" }
 kotest-assertionsCore = { module = "io.kotest:kotest-assertions-core", version.ref = "kotest" }
 kotlin-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinLogging = { module = "io.github.microutils:kotlin-logging", version.ref = "kotlinLogging" }
+logbackClassic = { module = "ch.qos.logback:logback-classic", version.ref = "logbackClassic" }
 mockk = { module = "io.mockk:mockk", version.ref = "mockk" }
 
 [bundles]
@@ -38,6 +40,7 @@ junit-jupiter = [
 junit-runtime = [
     "junit-jupiter-engine",
     "junit-platform-launcher",
+    "logbackClassic",
 ]
 
 [plugins]

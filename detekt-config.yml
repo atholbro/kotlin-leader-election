@@ -32,8 +32,4 @@ style:
     excludeCommentStatements: false
     excludeRawStrings: true
   MagicNumber:
-    ignorePropertyDeclaration: true
-    ignoreAnnotation: true
-    ignoreEnums: true
-    ignoreRanges: true
-#    active: false
+    active: false

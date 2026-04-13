@@ -14,8 +14,8 @@ plugins {
 
 dependencies {
     api(libs.k8s.client)
+    api(libs.kotlin.coroutines.core)
 
-    implementation(libs.kotlin.coroutines.core)
     implementation(libs.kotlinLogging)
 
     testImplementation(libs.mockk)

@@ -6,9 +6,13 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.collections.shouldContainExactlyInAnyOrder
 import io.kotest.matchers.shouldBe
 import io.kubernetes.client.openapi.ApiException
+import io.kubernetes.client.openapi.apis.CoordinationV1Api
 import io.kubernetes.client.openapi.models.V1Lease
-import io.kubernetes.client.openapi.models.V1LeaseSpec
 import io.kubernetes.client.openapi.models.V1ObjectMeta
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.mockkStatic
+import io.mockk.unmockkStatic
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -16,9 +20,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.time.ZoneOffset
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -40,6 +48,7 @@ class LeaderElectorTest {
         leaseDuration: Duration = 1.seconds,
         renewalDelay: Duration = 250.milliseconds,
         clock: Clock = Clock.System,
+        onError: (cause: Throwable, isFatal: Boolean) -> Unit = { _, _ -> },
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
     ) = LeaderElector(
@@ -50,6 +59,7 @@ class LeaderElectorTest {
         leaseDuration = leaseDuration,
         renewalDelay = renewalDelay,
         clock = clock,
+        onError = onError,
         onFollower = onFollower,
         onLeader = onLeader,
     )
@@ -256,6 +266,74 @@ class LeaderElectorTest {
         }
     }
 
+    @Test
+    fun `if an active leader observes another holder it transitions to follower`() {
+        val channel = Channel<Boolean>()
+        val leaseName = "role-transition-lease"
+        val elector = testElector(
+            leaseName = leaseName,
+            identity = "test-elector-1",
+            onFollower = { channel.send(false) },
+        ) {
+            channel.send(true)
+        }
+
+        runBlocking {
+            elector.start()
+            withTimeout(5.seconds) { channel.receive() } shouldBe true
+
+            val existingLease = mockApi.readNamespacedLease(leaseName, "ns1")
+            mockApi.replaceNamespacedLease(
+                leaseName = leaseName,
+                namespace = "ns1",
+                lease = existingLease.buildAcquire(
+                    identity = "other-elector",
+                    leaseDurationSeconds = 30,
+                    clock = Clock.System,
+                ),
+            )
+
+            withTimeout(5.seconds) { channel.receive() } shouldBe false
+            elector.stop()
+        }
+    }
+
+    @Test
+    fun `if role is leader but lease holder changed stop does not release lease`() {
+        val channel = Channel<Boolean>()
+        val leaseName = "release-skip-lease"
+        val elector = testElector(
+            leaseName = leaseName,
+            identity = "test-elector-1",
+            renewalDelay = 5.seconds,
+        ) {
+            channel.send(true)
+        }
+
+        runBlocking {
+            elector.start()
+            withTimeout(5.seconds) { channel.receive() } shouldBe true
+
+            val existingLease = mockApi.readNamespacedLease(leaseName, "ns1")
+            mockApi.replaceNamespacedLease(
+                leaseName = leaseName,
+                namespace = "ns1",
+                lease = existingLease.buildAcquire(
+                    identity = "other-elector",
+                    leaseDurationSeconds = 30,
+                    clock = Clock.System,
+                ),
+            )
+
+            elector.stop()
+        }
+
+        mockApi.callLog
+            .filterIsInstance<ReplaceNamespacedLease>()
+            .filter { it.leaseName == leaseName }
+            .any { it.response.spec?.holderIdentity == null } shouldBe false
+    }
+
     @Nested
     @DisplayName("API Spec")
     inner class ApiSpecTests {
@@ -343,14 +421,16 @@ class LeaderElectorTest {
             // create and lock
             mockApi.createNamespacedLease(
                 namespace = "ns1",
-                lease = V1Lease()
-                    .metadata(V1ObjectMeta().name(leaseName).namespace("ns1"))
-                    .spec(
-                        V1LeaseSpec()
-                            .holderIdentity("other-elector")
-                            .leaseDurationSeconds(1)
-                            .renewTime(clock.now().toJavaInstant().atOffset(ZoneOffset.UTC).minusSeconds(2)),
-                    ),
+                lease = buildLeaseResource(
+                    leaseName = leaseName,
+                    namespace = "ns1",
+                    identity = "other-elector",
+                    leaseDurationSeconds = 1,
+                    resourceVersion = null,
+                    clock = clock,
+                ).apply {
+                    spec!!.renewTime = clock.now().toJavaInstant().atOffset(ZoneOffset.UTC).minusSeconds(2)
+                },
             )
 
             val elector = testElector(leaseName = leaseName, identity = "test-elector-2", clock = clock) {
@@ -460,11 +540,12 @@ class LeaderElectorTest {
     inner class ErrorHandlingTests {
         @Test
         fun `when read gets unknown api error elector retries and eventually becomes leader`() {
-            var readCount = 0
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi by mockApi {
+                private var readCount = 0
+
                 override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease {
-                    readCount += 1
-                    if (readCount == 1) {
+                    if (++readCount == 1) {
                         throw ApiException(0, "unknown")
                     }
                     return mockApi.readNamespacedLease(leaseName, namespace)
@@ -476,14 +557,17 @@ class LeaderElectorTest {
                 leaseName = "unknown-read-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) {
                 channel.send(true)
             }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe false
+                (cause is ApiException) shouldBe true
                 withTimeout(5.seconds) { channel.receive() } shouldBe true
-                (readCount > 1) shouldBe true
                 elector.stop()
             }
         }
@@ -556,11 +640,12 @@ class LeaderElectorTest {
 
         @Test
         fun `when read gets transient error elector retries and eventually becomes leader`() {
-            var readCount = 0
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi by mockApi {
+                private var readCount = 0
+
                 override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease {
-                    readCount += 1
-                    if (readCount == 1) {
+                    if (++readCount == 1) {
                         throw ApiException(500, "transient")
                     }
                     return mockApi.readNamespacedLease(leaseName, namespace)
@@ -572,14 +657,17 @@ class LeaderElectorTest {
                 leaseName = "transient-read-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) {
                 channel.send(true)
             }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe false
+                (cause as ApiException).code shouldBe 500
                 withTimeout(5.seconds) { channel.receive() } shouldBe true
-                (readCount > 1) shouldBe true
                 elector.stop()
             }
         }
@@ -652,12 +740,9 @@ class LeaderElectorTest {
 
         @Test
         fun `when read gets auth error elector loop exits`() {
-            var readCount = 0
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi {
-                override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease {
-                    readCount += 1
-                    throw ApiException(401, "unauthorized")
-                }
+                override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease = throw ApiException(401, "unauthorized")
 
                 override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease = throw ApiException(500, "should not be called")
 
@@ -668,23 +753,25 @@ class LeaderElectorTest {
                 leaseName = "auth-error-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) { }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                (cause as ApiException).code shouldBe 401
                 delay(500.milliseconds)
-                readCount shouldBe 1
                 elector.stop()
             }
         }
 
         @Test
         fun `when read throws unexpected exception elector loop exits`() {
-            var readCount = 0
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
             val api = object : CoordinationApi {
                 override fun readNamespacedLease(leaseName: String, namespace: String): V1Lease {
-                    readCount += 1
-                    throw IllegalStateException("boom")
+                    error("boom")
                 }
 
                 override fun createNamespacedLease(namespace: String, lease: V1Lease): V1Lease = throw ApiException(500, "should not be called")
@@ -696,13 +783,128 @@ class LeaderElectorTest {
                 leaseName = "throwable-error-lease",
                 identity = "test-elector-1",
                 api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
             ) { }
 
             runBlocking {
                 elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                cause.message shouldBe "boom"
                 delay(500.milliseconds)
-                readCount shouldBe 1
                 elector.stop()
+            }
+        }
+
+        @Test
+        fun `when lease spec is missing during acquire elector loop exits`() {
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
+            mockApi.createNamespacedLease(
+                namespace = "ns1",
+                lease = V1Lease().metadata(V1ObjectMeta().name("test").namespace("ns1")),
+            )
+
+            val channel = Channel<Boolean>()
+            val elector = testElector(
+                leaseName = "test",
+                identity = "test-elector-1",
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
+                onFollower = { channel.send(false) },
+            ) { channel.send(true) }
+
+            runBlocking {
+                elector.start()
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                cause.message shouldBe "Invalid lease, missing spec"
+
+                shouldThrow<TimeoutCancellationException> {
+                    withTimeout(1.seconds) { channel.receive() }
+                }
+            }
+        }
+
+        @Test
+        fun `when fatal error happens as leader the lease is released and elector can restart`() {
+            val api = object : CoordinationApi by mockApi {
+                private var replaceCount = 0
+                override fun replaceNamespacedLease(leaseName: String, namespace: String, lease: V1Lease): V1Lease {
+                    if (++replaceCount == 1) {
+                        error("boom")
+                    }
+
+                    return mockApi.replaceNamespacedLease(leaseName, namespace, lease)
+                }
+            }
+
+            val errorChannel = Channel<Pair<Throwable, Boolean>>(capacity = Channel.UNLIMITED)
+            val channel = Channel<Boolean>()
+            val elector = testElector(
+                identity = "test-elector-1",
+                api = api,
+                onError = { cause, isFatal -> errorChannel.trySend(cause to isFatal) },
+            ) {
+                channel.send(true)
+            }
+
+            runBlocking {
+                elector.start()
+                withTimeout(5.seconds) { channel.receive() } shouldBe true
+
+                val (cause, isFatal) = withTimeout(5.seconds) { errorChannel.receive() }
+                isFatal shouldBe true
+                cause.message shouldBe "boom"
+
+                // wait for clean up call
+                shouldNotThrow<TimeoutCancellationException> {
+                    withTimeout(5.seconds) {
+                        while (
+                            mockApi.callLog
+                                .filterIsInstance<ReplaceNamespacedLease>()
+                                .none { it.response.spec?.holderIdentity == null }
+                        ) {
+                            delay(25.milliseconds)
+                        }
+                    }
+                }
+
+                elector.start()
+                withTimeout(5.seconds) { channel.receive() } shouldBe true
+                elector.stop()
+            }
+        }
+
+        @Test
+        fun `when lease spec is missing during release stop throws and elector loop exits`() {
+            val channel = Channel<Boolean>()
+            val elector = testElector(
+                leaseName = "test",
+                identity = "test-elector-1",
+                renewalDelay = 1.seconds,
+            ) {
+                channel.send(true)
+            }
+
+            runBlocking {
+                elector.start()
+                withTimeout(5.seconds) { channel.receive() } shouldBe true
+
+                val existingLease = mockApi.readNamespacedLease("test", "ns1")
+                mockApi.replaceNamespacedLease(
+                    leaseName = "test",
+                    namespace = "ns1",
+                    lease = V1Lease().metadata(
+                        V1ObjectMeta()
+                            .name("test")
+                            .namespace("ns1")
+                            .resourceVersion(existingLease.metadata!!.resourceVersion),
+                    ),
+                )
+
+                val exception = shouldThrow<IllegalStateException> {
+                    elector.stop()
+                }
+                exception.message shouldBe "Invalid lease, missing spec"
             }
         }
 
@@ -768,6 +970,158 @@ class LeaderElectorTest {
                     elector.stop()
                 }
                 exception.code shouldBe 0
+            }
+        }
+
+        @Test
+        fun `errors when lease has null duration`() {
+            val channel = Channel<Boolean>()
+            val elector = testElector(identity = "test-1", onFollower = { channel.send(false) }) {
+                channel.send(true)
+            }
+
+            mockApi.createNamespacedLease(
+                namespace = "ns1",
+                lease = buildLeaseResource(
+                    leaseName = "test-lease",
+                    namespace = "ns1",
+                    identity = "test-1",
+                    leaseDurationSeconds = 1,
+                    resourceVersion = "1.0.0",
+                    clock = Clock.System,
+                ).apply { spec!!.leaseDurationSeconds(null) },
+            )
+
+            runBlocking {
+                shouldThrow<TimeoutCancellationException> {
+                    elector.start()
+                    withTimeout(1.seconds) { channel.receive() }
+                }
+            }
+        }
+
+        @ParameterizedTest
+        @ValueSource(ints = [-1, 0])
+        @DisplayName("errors when lease has {} second duration")
+        fun invalidLeaseDurationTest(value: Int) {
+            val channel = Channel<Boolean>()
+            val elector = testElector(identity = "test-1", onFollower = { channel.send(false) }) {
+                channel.send(true)
+            }
+
+            mockApi.createNamespacedLease(
+                namespace = "ns1",
+                lease = buildLeaseResource(
+                    leaseName = "test-lease",
+                    namespace = "ns1",
+                    identity = "test-1",
+                    leaseDurationSeconds = 1,
+                    resourceVersion = "1.0.0",
+                    clock = Clock.System,
+                ).apply { spec!!.leaseDurationSeconds(value) },
+            )
+
+            runBlocking {
+                shouldThrow<TimeoutCancellationException> {
+                    elector.start()
+                    withTimeout(1.seconds) { channel.receive() }
+                }
+            }
+        }
+
+        @Test
+        fun `assumes lease has expired if renewTime is null`() {
+            val channel = Channel<Boolean>()
+            val elector = testElector(identity = "test-1", onFollower = { channel.send(false) }) {
+                channel.send(true)
+            }
+
+            mockApi.createNamespacedLease(
+                namespace = "ns1",
+                lease = buildLeaseResource(
+                    leaseName = "test-lease",
+                    namespace = "ns1",
+                    identity = "test-1",
+                    leaseDurationSeconds = 1,
+                    resourceVersion = "1.0.0",
+                    clock = Clock.System,
+                ).apply { spec!!.renewTime(null) },
+            )
+
+            runBlocking {
+                elector.start()
+                withTimeout(1.seconds) { channel.receive() } shouldBe true
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("Constructors")
+    inner class ConstructorTests {
+        @BeforeEach
+        fun beforeEach() {
+            mockkStatic("net.aholbrook.kotlinleaderelection.UtilsKt")
+            every { getNamespace() } returns "ns1"
+            every { getHostname() } returns "host1"
+        }
+
+        @AfterEach
+        fun afterEach() {
+            unmockkStatic("net.aholbrook.kotlinleaderelection.UtilsKt")
+        }
+
+        @Test
+        fun `secondary constructor can be created with default optional args`() {
+            shouldNotThrowAny {
+                LeaderElector(leaseName = "ctor-defaults-1") { }
+            }
+        }
+
+        @Test
+        fun `secondary constructor can be created with explicit optional args`() {
+            shouldNotThrowAny {
+                LeaderElector(
+                    leaseName = "ctor-explicit-1",
+                    api = mockk<CoordinationV1Api>(relaxed = true),
+                    leaseDuration = 2.seconds,
+                    renewalDelay = 1.seconds,
+                    onFollower = { },
+                ) { }
+            }
+        }
+
+        @Test
+        fun `expanded secondary constructor can be created with default optional args`() {
+            shouldNotThrowAny {
+                LeaderElector(
+                    leaseName = "ctor-defaults-2",
+                    identity = "id1",
+                ) { }
+            }
+        }
+
+        @Test
+        fun `expanded secondary constructor can be created with default identity`() {
+            shouldNotThrowAny {
+                LeaderElector(
+                    leaseName = "ctor-default-identity",
+                    namespace = "ns2",
+                ) { }
+            }
+        }
+
+        @Test
+        fun `expanded secondary constructor can be created with explicit optional args`() {
+            shouldNotThrowAny {
+                LeaderElector(
+                    leaseName = "ctor-explicit-2",
+                    namespace = "ns2",
+                    identity = "id2",
+                    api = mockk<CoordinationV1Api>(relaxed = true),
+                    leaseDuration = 2.seconds,
+                    renewalDelay = 1.seconds,
+                    onFollower = { },
+                ) { }
             }
         }
     }

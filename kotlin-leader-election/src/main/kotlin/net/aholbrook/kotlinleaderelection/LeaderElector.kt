@@ -3,8 +3,6 @@ package net.aholbrook.kotlinleaderelection
 import io.kubernetes.client.openapi.ApiException
 import io.kubernetes.client.openapi.apis.CoordinationV1Api
 import io.kubernetes.client.openapi.models.V1Lease
-import io.kubernetes.client.openapi.models.V1LeaseSpec
-import io.kubernetes.client.openapi.models.V1ObjectMeta
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
@@ -32,6 +30,14 @@ private enum class Role {
     STOPPED,
 }
 
+/**
+ * Coordinates Kubernetes lease-based leader election.
+ *
+ * The elector runs a background coroutine that periodically reads or updates the target Lease.
+ * Role changes trigger [onLeader] and [onFollower]. Errors are reported through [onError].
+ *
+ * Call [start] to begin participating in election and [stop] to stop participating.
+ */
 class LeaderElector internal constructor(
     private val leaseName: String,
     private val namespace: String,
@@ -40,6 +46,7 @@ class LeaderElector internal constructor(
     private val leaseDuration: Duration,
     private val renewalDelay: Duration,
     private val clock: Clock,
+    private val onError: (cause: Throwable, isFatal: Boolean) -> Unit,
     private val onFollower: (suspend () -> Unit),
     private val onLeader: suspend () -> Unit,
 ) {
@@ -50,11 +57,23 @@ class LeaderElector internal constructor(
     private var role: Role = Role.STOPPED
     private var electorJob: Job = Job().apply { complete() }
 
+    /**
+     * Creates an elector using namespace and identity discovered from the runtime environment.
+     *
+     * @param leaseName lease name used for election coordination
+     * @param api Kubernetes Coordination API client
+     * @param leaseDuration desired lease duration used when creating or acquiring the lease
+     * @param renewalDelay delay between election loop iterations
+     * @param onError callback for elector loop errors, with `isFatal=true` when the loop exits
+     * @param onFollower callback invoked when this elector transitions to follower
+     * @param onLeader callback invoked when this elector transitions to leader
+     */
     constructor(
         leaseName: String,
         api: CoordinationV1Api = CoordinationV1Api(),
         leaseDuration: Duration = 30.seconds,
         renewalDelay: Duration = 5.seconds,
+        onError: (cause: Throwable, isFatal: Boolean) -> Unit = { _, _ -> },
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
     ) : this(
@@ -65,10 +84,24 @@ class LeaderElector internal constructor(
         leaseDuration = leaseDuration,
         renewalDelay = renewalDelay,
         clock = Clock.System,
+        onError = onError,
         onFollower = onFollower,
         onLeader = onLeader,
     )
 
+    /**
+     * Creates an elector with explicit namespace and identity values.
+     *
+     * @param leaseName lease name used for election coordination
+     * @param namespace Kubernetes namespace where the Lease exists
+     * @param identity leaseholder identity written to the Lease when leader
+     * @param api Kubernetes Coordination API client
+     * @param leaseDuration desired lease duration used when creating or acquiring the lease
+     * @param renewalDelay delay between election loop iterations
+     * @param onError callback for elector loop errors, with `isFatal=true` when the loop exits
+     * @param onFollower callback invoked when this elector transitions to follower
+     * @param onLeader callback invoked when this elector transitions to leader
+     */
     constructor(
         leaseName: String,
         namespace: String = getNamespace(),
@@ -76,6 +109,7 @@ class LeaderElector internal constructor(
         api: CoordinationV1Api = CoordinationV1Api(),
         leaseDuration: Duration = 30.seconds,
         renewalDelay: Duration = 5.seconds,
+        onError: (cause: Throwable, isFatal: Boolean) -> Unit = { _, _ -> },
         onFollower: (suspend () -> Unit) = { },
         onLeader: suspend () -> Unit,
     ) : this(
@@ -86,10 +120,19 @@ class LeaderElector internal constructor(
         leaseDuration = leaseDuration,
         renewalDelay = renewalDelay,
         clock = Clock.System,
+        onError = onError,
         onFollower = onFollower,
         onLeader = onLeader,
     )
 
+    /**
+     * Starts participating in leader election.
+     *
+     * This function returns after launching the elector loop. It is safe to call multiple times;
+     * subsequent calls while already running are no-ops.
+     *
+     * @param dispatcher dispatcher used to execute [onLeader] and [onFollower]
+     */
     suspend fun start(dispatcher: CoroutineDispatcher = Dispatchers.Default) {
         lifecycleMutex.withLock {
             if (electorJob.isActive) return@withLock
@@ -100,6 +143,11 @@ class LeaderElector internal constructor(
         }
     }
 
+    /**
+     * Stops participating in leader election and waits for background work to finish.
+     *
+     * If this elector is currently leader, it attempts to release the lease before stopping.
+     */
     suspend fun stop() {
         lifecycleMutex.withLock {
             electorJob.cancelAndJoin()
@@ -130,25 +178,36 @@ class LeaderElector internal constructor(
             } catch (e: ApiException) {
                 when (e.code) {
                     401, 403 -> {
+                        onError(e, true)
                         logger.error(e) { "Kubernetes API: auth error" }
                         break
                     }
 
                     500, 502, 503, 504 -> {
+                        onError(e, false)
                         logger.warn(e) { "Transient API error ${e.code}, will retry" }
                     }
 
                     else -> {
+                        onError(e, false)
                         logger.error(e) { "Unexpected Kubernetes API error" }
                     }
                 }
             } catch (e: Throwable) {
+                onError(e, true)
                 logger.error(e) { "Unexpected error" }
                 break
             }
 
             delay(renewalDelay)
         }
+
+        runCatching {
+            if (role == Role.LEADER) {
+                releaseLeaderRole()
+            }
+        }
+        role = Role.STOPPED
     }
 
     private fun CoroutineScope.startLeader(dispatcher: CoroutineDispatcher) =
@@ -175,13 +234,15 @@ class LeaderElector internal constructor(
             }
         }
 
-        val spec = lease.spec ?: return
+        val spec = lease.spec ?: error("Invalid lease, missing spec")
         val leader = spec.holderIdentity
         val renewTime = spec.renewTime
-        val leaseDurationSeconds = (spec.leaseDurationSeconds?.toLong() ?: leaseDuration.inWholeSeconds)
-            .coerceAtLeast(1)
+        val leaseDurationSeconds = requireNotNull(spec.leaseDurationSeconds) {
+            "Invalid lease, missing leaseDurationSeconds"
+        }
+        require(leaseDurationSeconds > 0) { "Invalid lease, leaseDurationSeconds must be positive" }
         val now = clock.now().toJavaInstant().atOffset(ZoneOffset.UTC)
-        val expired = renewTime == null || now.isAfter(renewTime.plusSeconds(leaseDurationSeconds))
+        val expired = renewTime == null || now.isAfter(renewTime.plusSeconds(leaseDurationSeconds.toLong()))
 
         when {
             leader == identity -> {
@@ -213,7 +274,7 @@ class LeaderElector internal constructor(
             }
         }
 
-        val spec = lease.spec ?: return
+        val spec = lease.spec ?: error("Invalid lease, missing spec")
         val leader = spec.holderIdentity
 
         if (leader == identity) {
@@ -254,50 +315,4 @@ class LeaderElector internal constructor(
             }
         }
     }
-}
-
-private fun buildLeaseResource(
-    leaseName: String,
-    namespace: String,
-    identity: String?,
-    leaseDurationSeconds: Int,
-    resourceVersion: String?,
-    clock: Clock,
-): V1Lease = V1Lease()
-    .metadata(
-        V1ObjectMeta()
-            .name(leaseName)
-            .namespace(namespace)
-            .resourceVersion(resourceVersion),
-    ).spec(
-        V1LeaseSpec()
-            .holderIdentity(identity)
-            .leaseDurationSeconds(leaseDurationSeconds.coerceAtLeast(1))
-            .renewTime(clock.now().toJavaInstant().atOffset(ZoneOffset.UTC)),
-    )
-
-private fun V1Lease.buildAcquire(identity: String, leaseDurationSeconds: Int, clock: Clock): V1Lease {
-    val metadata = requireNotNull(metadata)
-
-    return buildLeaseResource(
-        leaseName = requireNotNull(metadata.name),
-        namespace = requireNotNull(metadata.namespace),
-        identity = identity,
-        leaseDurationSeconds = leaseDurationSeconds,
-        resourceVersion = requireNotNull(metadata.resourceVersion),
-        clock = clock,
-    )
-}
-
-private fun V1Lease.buildRelease(clock: Clock): V1Lease {
-    val metadata = requireNotNull(metadata)
-
-    return buildLeaseResource(
-        leaseName = requireNotNull(metadata.name),
-        namespace = requireNotNull(metadata.namespace),
-        identity = null,
-        leaseDurationSeconds = 1,
-        resourceVersion = requireNotNull(metadata.resourceVersion),
-        clock = clock,
-    )
 }
